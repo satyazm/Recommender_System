@@ -6,6 +6,7 @@ significantly improved ranking, since "retrieved by repurchase at rank 1" is a
 very different signal from "retrieved by content-similarity at rank 40."
 """
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -57,28 +58,52 @@ def label_pool(pool: pd.DataFrame, ground_truth: dict[int, set[int]]) -> pd.Data
 def build_labeled_dataset(
     feature_df: pd.DataFrame, target_df: pd.DataFrame, target_date, user_map: pd.DataFrame,
     item_map: pd.DataFrame, articles: pd.DataFrame, customers: pd.DataFrame, k_per_source: int = 10,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, dict[int, set[int]]]:
     """feature_df must already be strictly before target_date. Fits fresh candidate-gen
     models on feature_df only, builds+labels the union candidate pool, and attaches
     every engineered feature. Returns (labeled_df, fitted_models) — models are returned
     so the same fit can be reused for the next call (e.g. val reuses what train touched)."""
-    models = {
-        "recency": RecencyRecommender().fit(feature_df),
-        "itemitem": ItemItemRecommender().fit(feature_df),
-        "als": ALSRecommender().fit(feature_df),
-        "popularity": PopularityRecommender().fit(feature_df),
-    }
-    user_idxs = feature_df["user_idx"].unique().tolist()
+    t0 = time.time()
+    def _log(msg):
+        print(f"  [{time.time() - t0:6.1f}s] {msg}", flush=True)
+
+    models = {}
+    for name, cls in [("recency", RecencyRecommender), ("itemitem", ItemItemRecommender),
+                       ("als", ALSRecommender), ("popularity", PopularityRecommender)]:
+        models[name] = cls().fit(feature_df)
+        _log(f"fit {name}")
+
+    # Restrict candidate generation to users active in the target window, not every
+    # user in feature_df's whole history — feature_df spans up to 2 years, so "every
+    # user who ever purchased" is ~1.3M people; generating + scoring candidates for
+    # all of them is both unnecessary (we can only label users we have a target
+    # outcome for) and, for ALS/item-item, prohibitively slow. This does mean the
+    # training set has no "recently active user who churned entirely" negatives —
+    # a real limitation worth naming, not a free simplification.
+    if "user_idx" in target_df.columns:
+        target_user_idxs = set(target_df["user_idx"])
+    else:
+        target_user_idxs = set(target_df.merge(user_map, on="customer_id")["user_idx"])
+    user_idxs = list(set(feature_df["user_idx"]) & target_user_idxs)
+    _log(f"target population = {len(user_idxs):,} users")
     pool = build_candidate_pool(models, user_idxs, k_per_source)
+    _log(f"built candidate pool, {len(pool):,} rows")
 
     ground_truth = build_ground_truth(target_df, user_map, item_map)
     pool = label_pool(pool, ground_truth)
+    _log("labeled pool")
 
     pool = user_item_history_features(feature_df, target_date, pool)
+    _log("user_item_history_features")
     pool = category_affinity_features(feature_df, articles, pool)
+    _log("category_affinity_features")
     pool = pool.merge(item_popularity_features(feature_df, target_date, item_map), on="item_idx", how="left")
+    _log("item_popularity_features")
     pool = pool.merge(item_price_features(feature_df, item_map), on="item_idx", how="left")
+    _log("item_price_features")
     pool = pool.merge(user_features(feature_df, target_date, user_map), on="user_idx", how="left")
+    _log("user_features")
     pool = pool.merge(articles, on="item_idx", how="left")
     pool = pool.merge(customers, on="user_idx", how="left")
+    _log("merged articles/customers")
     return pool, models, ground_truth

@@ -77,7 +77,7 @@ def category_affinity_features(feature_df: pd.DataFrame, articles: pd.DataFrame,
     """Does this candidate's product_type/department match what the user usually buys?"""
     art = articles[["item_idx", "product_type_name", "department_name"]]
     user_hist = feature_df.merge(art, on="item_idx", how="left")
-    type_counts = user_hist.groupby(["user_idx", "product_type_name"]).size().rename("n").reset_index()
+    type_counts = user_hist.groupby(["user_idx", "product_type_name"], observed=True).size().rename("n").reset_index()
     user_type_totals = user_hist.groupby("user_idx").size().rename("total").reset_index()
     type_affinity = type_counts.merge(user_type_totals, on="user_idx")
     type_affinity["type_affinity"] = type_affinity["n"] / type_affinity["total"]

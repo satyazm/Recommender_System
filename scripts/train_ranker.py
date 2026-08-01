@@ -110,3 +110,34 @@ for name, recs in [("heuristic (best source rank)", heuristic_recs), ("LightGBM 
 print("\nTop 15 feature importances:")
 importances = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
 print(importances.head(15).to_string())
+
+# --- Persist what Phase 5 serving needs ---
+# The LightGBM+candidate-gen pipeline is too slow to run per-request (this whole
+# script takes ~18 min), so serving works off precomputed recommendations for the
+# population we already scored here, not a live call into this pipeline.
+import os
+
+import joblib
+
+os.makedirs("models", exist_ok=True)
+joblib.dump(
+    {"model": model, "feature_cols": feature_cols, "categorical_cols": categorical_cols},
+    "models/lightgbm_ranker.joblib",
+)
+
+precomputed = ranked.groupby("user_idx")["item_idx"].apply(lambda s: list(s)[:TOP_N]).reset_index(name="item_idxs")
+precomputed = precomputed.merge(user_map, on="user_idx")
+precomputed.to_parquet("models/precomputed_recs.parquet", index=False)
+
+top_popular = item_map[item_map["item_idx"].isin(val_models["popularity"].ranked_items_[:TOP_N])].copy()
+top_popular["rank"] = top_popular["item_idx"].map({v: i for i, v in enumerate(val_models["popularity"].ranked_items_)})
+top_popular = top_popular.sort_values("rank")
+top_popular[["article_id"]].to_parquet("models/popularity_fallback.parquet", index=False)
+
+als_model = val_models["als"].model
+np.save("models/als_item_factors.npy", als_model.item_factors.astype(np.float32))
+item_map.to_parquet("models/item_id_map_served.parquet", index=False)  # item_idx row order == item_factors row order
+
+print(f"\nSaved serving artifacts -> models/ "
+      f"({len(precomputed):,} users precomputed, {len(top_popular)} popularity fallback items, "
+      f"item embeddings {als_model.item_factors.shape})")
